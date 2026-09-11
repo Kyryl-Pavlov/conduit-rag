@@ -1,7 +1,19 @@
+data "aws_caller_identity" "current" {}
+
 locals {
   prefix   = "${var.app_name}-${var.environment}"
   src_root = "${path.module}/../../../../src"
   runtime  = "python3.12"
+
+  # Hand-constructed rather than referencing module.video_pipeline's output
+  # directly: video_pipeline depends on THIS module's video_completion
+  # function ARN, so a direct reference the other way would be a module
+  # cycle. Both sides must independently compute the same deterministic name
+  # -- see aws_sfn_state_machine.video_analysis in modules/video_pipeline,
+  # which must use this exact "${local.prefix}-video-analysis" name. Same
+  # class of problem as common/transcription.py's transcription_job_arn()
+  # helper, solved the same way (hand-build the ARN instead of looking it up).
+  video_state_machine_arn = "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:stateMachine:${local.prefix}-video-analysis"
 }
 
 # ── Common layer ─────────────────────────────────────────────────────────────
@@ -100,10 +112,13 @@ resource "aws_lambda_function" "dispatcher" {
 
   environment {
     variables = {
-      WORKER_QUEUE_URL  = var.worker_queue_url
-      FILE_STATUS_TABLE = var.file_status_table_name
-      NUM_PARTITIONS    = "10"
-      MAX_PDF_BYTES     = tostring(50 * 1024 * 1024)
+      WORKER_QUEUE_URL        = var.worker_queue_url
+      FILE_STATUS_TABLE       = var.file_status_table_name
+      NUM_PARTITIONS          = "10"
+      MAX_PDF_BYTES           = tostring(50 * 1024 * 1024)
+      VIDEO_PROVIDER          = var.video_provider
+      MAX_VIDEO_BYTES         = tostring(10 * 1024 * 1024 * 1024)
+      VIDEO_STATE_MACHINE_ARN = local.video_state_machine_arn
     }
   }
 
@@ -211,4 +226,135 @@ resource "aws_lambda_event_source_mapping" "db_writer" {
   batch_size                         = 10
   maximum_batching_window_in_seconds = 5
   enabled                            = true
+}
+
+# ── transcribe_completion function ────────────────────────────────────────
+# The async second half of audio dispatch: dispatcher's real-mode audio
+# branch only starts a Transcribe job and returns (transcription can take
+# minutes, well past what's reasonable to hold a synchronous Lambda open
+# for); this function picks up once that job reaches a terminal state and
+# does the staging/fan-out dispatcher does synchronously for .txt/.pdf. No
+# extra layer beyond `common` -- Transcribe is a plain boto3 client, same
+# tier as rds-data, not like dispatcher's pypdf dependency.
+
+data "archive_file" "transcribe_completion" {
+  type        = "zip"
+  source_file = "${local.src_root}/transcribe_completion/handler.py"
+  output_path = "${path.module}/build/transcribe_completion.zip"
+}
+
+resource "aws_cloudwatch_log_group" "transcribe_completion" {
+  name              = "/aws/lambda/${local.prefix}-transcribe-completion"
+  retention_in_days = 14
+}
+
+resource "aws_lambda_function" "transcribe_completion" {
+  function_name    = "${local.prefix}-transcribe-completion"
+  role             = var.transcribe_completion_role_arn
+  handler          = "handler.handler"
+  runtime          = local.runtime
+  timeout          = var.transcribe_completion_timeout_seconds
+  memory_size      = 512 # headroom for collapsing Transcribe's word-level output JSON into JSONL
+  filename         = data.archive_file.transcribe_completion.output_path
+  source_code_hash = data.archive_file.transcribe_completion.output_base64sha256
+  layers           = [aws_lambda_layer_version.common.arn]
+
+  environment {
+    variables = {
+      WORKER_QUEUE_URL  = var.worker_queue_url
+      FILE_STATUS_TABLE = var.file_status_table_name
+      NUM_PARTITIONS    = "10"
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.transcribe_completion]
+}
+
+# EventBridge (push), not aws_lambda_event_source_mapping (poll) -- Transcribe
+# job state changes aren't an SQS/stream source. This is the only Lambda in
+# the pipeline invoked asynchronously rather than SQS-triggered, so unlike
+# every other function here it gets no visibility-timeout/DLQ retry for free;
+# aws_lambda_function_event_invoke_config below makes that retry behavior
+# explicit instead of relying on Lambda's async-invoke defaults. A real
+# on-failure destination is out of scope for this phase, same tier as the
+# not-yet-built redrive Lambda (see CLAUDE.md).
+#
+# ASSUMPTION, verify against real AWS: this event pattern shape
+# (source/detail-type/detail.TranscriptionJobStatus).
+resource "aws_cloudwatch_event_rule" "transcribe_job_state_change" {
+  name = "${local.prefix}-transcribe-job-state-change"
+
+  event_pattern = jsonencode({
+    source      = ["aws.transcribe"]
+    detail-type = ["Transcribe Job State Change"]
+    detail = {
+      TranscriptionJobStatus = ["COMPLETED", "FAILED"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "transcribe_completion" {
+  rule = aws_cloudwatch_event_rule.transcribe_job_state_change.name
+  arn  = aws_lambda_function.transcribe_completion.arn
+}
+
+resource "aws_lambda_permission" "allow_eventbridge" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.transcribe_completion.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.transcribe_job_state_change.arn
+}
+
+resource "aws_lambda_function_event_invoke_config" "transcribe_completion" {
+  function_name          = aws_lambda_function.transcribe_completion.function_name
+  maximum_retry_attempts = 2
+}
+
+# ── video_completion function ─────────────────────────────────────────────
+# The async second half of real-mode video dispatch: dispatcher's real-mode
+# video branch only starts a Step Functions execution and returns (a
+# vision-LLM call can run well past what's reasonable to hold a synchronous
+# Lambda open for); this function is invoked DIRECTLY by that state machine
+# once its Fargate task finishes (see modules/video_pipeline), not by
+# EventBridge -- Step Functions already knows success/failure via its own
+# Catch and passes file_id/s3_bucket through as the execution's JSON input,
+# so unlike transcribe_completion this function needs no push-trigger
+# plumbing (no aws_cloudwatch_event_rule/target, no resource-based
+# aws_lambda_permission -- Step Functions invokes via its own execution
+# role's IAM identity) and no async-invoke retry config (Step Functions'
+# Task-state retry/Catch semantics cover that instead of Lambda's own
+# async-invoke machinery).
+
+data "archive_file" "video_completion" {
+  type        = "zip"
+  source_file = "${local.src_root}/video_completion/handler.py"
+  output_path = "${path.module}/build/video_completion.zip"
+}
+
+resource "aws_cloudwatch_log_group" "video_completion" {
+  name              = "/aws/lambda/${local.prefix}-video-completion"
+  retention_in_days = 14
+}
+
+resource "aws_lambda_function" "video_completion" {
+  function_name    = "${local.prefix}-video-completion"
+  role             = var.video_completion_role_arn
+  handler          = "handler.handler"
+  runtime          = local.runtime
+  timeout          = var.video_completion_timeout_seconds
+  memory_size      = 256
+  filename         = data.archive_file.video_completion.output_path
+  source_code_hash = data.archive_file.video_completion.output_base64sha256
+  layers           = [aws_lambda_layer_version.common.arn]
+
+  environment {
+    variables = {
+      WORKER_QUEUE_URL  = var.worker_queue_url
+      FILE_STATUS_TABLE = var.file_status_table_name
+      NUM_PARTITIONS    = "10"
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.video_completion]
 }

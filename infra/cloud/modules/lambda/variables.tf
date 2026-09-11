@@ -69,3 +69,32 @@ variable "aurora_database_name" {
 variable "db_writer_timeout_seconds" {
   type = number
 }
+
+variable "transcribe_completion_role_arn" {
+  type = string
+}
+
+variable "transcribe_completion_timeout_seconds" {
+  type = number
+}
+
+variable "aws_region" {
+  # Needed to hand-construct the video-analysis state machine's ARN (see
+  # local.video_state_machine_arn) rather than reference video_pipeline's
+  # output directly -- referencing it would create a module cycle, since
+  # video_pipeline itself depends on this module's video_completion function
+  # ARN.
+  type = string
+}
+
+variable "video_completion_role_arn" {
+  type = string
+}
+
+variable "video_completion_timeout_seconds" {
+  type = number
+}
+
+variable "video_provider" {
+  type = string
+}

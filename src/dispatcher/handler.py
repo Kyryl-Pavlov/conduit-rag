@@ -11,12 +11,26 @@ the same bucket -- `.extracted`, never `.txt`/`.pdf`, since either of those
 would re-trigger this same S3 notification (see infra/cloud/main.tf) and
 double-dispatch the extracted object as if it were an independent upload.
 
-Partitioning and worker fan-out then run identically for both file types,
-against whichever object (original .txt, or extracted-text stand-in for .pdf)
-holds plain text: `WorkerMessage.s3_key`/`file_size_bytes` point at that text
+Partitioning and worker fan-out then run identically for .txt/.pdf, against
+whichever object (original .txt, or extracted-text stand-in for .pdf) holds
+plain text: `WorkerMessage.s3_key`/`file_size_bytes` point at that text
 object, while `file_id` (and the `file_status` record's `s3_key`/
 `file_size_bytes`, used for status display) always stay the original upload's
-key/size. worker/db_writer need no PDF-specific logic at all as a result.
+key/size. worker/db_writer need no PDF-specific logic at all as a result. The
+shared partition/create-file_status/fan-out tail lives in
+`common.fanout.fan_out_partitions`.
+
+Audio files (see `common.transcription.AUDIO_EXTENSIONS`) are the third,
+structurally different exception: transcription is an async job that can run
+for minutes, so dispatcher can't extract-and-continue synchronously the way
+it does for PDF. See `_dispatch_audio_upload`'s docstring for the two-phase
+split this implies.
+
+Video files (see `common.video.VIDEO_EXTENSIONS`) are a fourth exception,
+structurally identical in shape to audio's two-phase split but orchestrated
+differently: the async work (a pluggable, possibly-slow vision-LLM call) runs
+on a Fargate task via Step Functions instead of AWS Transcribe, since there's
+no managed AWS service for this. See `_dispatch_video_upload`'s docstring.
 """
 
 from __future__ import annotations
@@ -24,34 +38,47 @@ from __future__ import annotations
 import json
 import os
 import urllib.parse
-from dataclasses import asdict
 
 import boto3
 
-from common.chunking import compute_partitions
-from common.db import create_failed_file_status_record, create_file_status_record
-from common.models import WorkerMessage
+from common.db import create_failed_file_status_record
+from common.fanout import fan_out_partitions
+from common.models import PartitionFormat
 from common.pdf import extract_pdf_text
+from common.transcription import (
+    AUDIO_EXTENSIONS,
+    TRANSCRIPTION_PROVIDER,
+    fake_transcript_jsonl,
+    start_transcription_job,
+)
+from common.video import (
+    VIDEO_EXTENSIONS,
+    VIDEO_PROVIDER,
+    fake_video_objects_jsonl,
+    start_video_analysis_execution,
+)
 
 WORKER_QUEUE_URL = os.environ.get("WORKER_QUEUE_URL")
 FILE_STATUS_TABLE = os.environ.get("FILE_STATUS_TABLE")
 NUM_PARTITIONS = int(os.environ.get("NUM_PARTITIONS", "10"))
 MAX_PDF_BYTES = int(os.environ.get("MAX_PDF_BYTES", str(50 * 1024 * 1024)))
+MAX_AUDIO_BYTES = int(os.environ.get("MAX_AUDIO_BYTES", str(2 * 1024 * 1024 * 1024)))
+MAX_VIDEO_BYTES = int(os.environ.get("MAX_VIDEO_BYTES", str(10 * 1024 * 1024 * 1024)))
+VIDEO_STATE_MACHINE_ARN = os.environ.get("VIDEO_STATE_MACHINE_ARN")
 
 EXTRACTED_TEXT_SUFFIX = ".extracted"
 
 
 class DispatchValidationError(ValueError):
     """Permanently-invalid input (bad extension, empty file, oversized or
-    textless PDF) -- redelivery of the same S3 event would hit the identical
-    error every time, so the caller records a failed file_status and does not
-    let SQS retry this message."""
+    textless PDF, oversized or empty audio/video) -- redelivery of the same
+    S3 event would hit the identical error every time, so the caller records
+    a failed file_status and does not let SQS retry this message."""
 
 
 # Module-scoped so warm Lambda invocations reuse the same client instead of
 # re-resolving the credential chain on every message.
 s3 = boto3.client("s3")
-sqs = boto3.client("sqs")
 
 
 def handler(event, context):
@@ -68,10 +95,15 @@ def _dispatch_s3_event(s3_event: dict) -> None:
         original_size_bytes = s3_info["object"]["size"]
 
         try:
+            if _is_audio_upload(file_id):
+                _dispatch_audio_upload(s3_bucket, file_id, original_size_bytes)
+                continue
+            if _is_video_upload(file_id):
+                _dispatch_video_upload(s3_bucket, file_id, original_size_bytes)
+                continue
             worker_s3_key, worker_size_bytes = _resolve_worker_object(
                 s3_bucket, file_id, original_size_bytes
             )
-            partitions = compute_partitions(worker_size_bytes, NUM_PARTITIONS)
         except DispatchValidationError as e:
             create_failed_file_status_record(
                 table_name=FILE_STATUS_TABLE,
@@ -83,36 +115,130 @@ def _dispatch_s3_event(s3_event: dict) -> None:
             )
             continue
 
-        total_workers = len(partitions)
-
-        created = create_file_status_record(
-            table_name=FILE_STATUS_TABLE,
+        fan_out_partitions(
             file_id=file_id,
             s3_bucket=s3_bucket,
-            s3_key=file_id,
-            file_size_bytes=original_size_bytes,
-            total_workers=total_workers,
+            original_s3_key=file_id,
+            original_file_size_bytes=original_size_bytes,
+            worker_s3_key=worker_s3_key,
+            worker_size_bytes=worker_size_bytes,
+            num_partitions=NUM_PARTITIONS,
+            worker_queue_url=WORKER_QUEUE_URL,
+            file_status_table=FILE_STATUS_TABLE,
         )
-        if not created:
-            # Redelivery of an already-dispatched event: skip re-fanning-out
-            # worker-queue messages, since that would duplicate work.
-            continue
 
-        for worker_index, (start_byte, end_byte) in enumerate(partitions):
-            message = WorkerMessage(
-                file_id=file_id,
-                s3_bucket=s3_bucket,
-                s3_key=worker_s3_key,
-                file_size_bytes=worker_size_bytes,
-                worker_index=worker_index,
-                total_workers=total_workers,
-                start_byte=start_byte,
-                end_byte=end_byte,
-            )
-            sqs.send_message(
-                QueueUrl=WORKER_QUEUE_URL,
-                MessageBody=json.dumps(asdict(message)),
-            )
+
+def _is_audio_upload(file_id: str) -> bool:
+    return file_id.lower().endswith(tuple(AUDIO_EXTENSIONS))
+
+
+def _dispatch_audio_upload(s3_bucket: str, file_id: str, original_size_bytes: int) -> None:
+    """Audio can't reuse `_resolve_worker_object`'s synchronous
+    (key, size)-returning contract: real transcription is an async job that
+    can run for minutes, unlike pypdf's in-process, single-invocation parse.
+
+    `TRANSCRIPTION_PROVIDER=fake` (local dev, no Transcribe/EventBridge
+    emulator exists) fabricates a transcript inline and fans out immediately,
+    in this same invocation -- same shape as the .txt/.pdf tail.
+    `TRANSCRIPTION_PROVIDER=transcribe` (real) starts the job and returns; the
+    `transcribe_completion` Lambda (triggered by EventBridge once the job
+    finishes) stages the real transcript and calls `fan_out_partitions` from
+    there instead. Either way, no `file_status` record exists for this file
+    until whichever path's `fan_out_partitions` call runs -- so a real-mode
+    audio upload is invisible in the frontend for the duration of
+    transcription. Accepted, documented limitation (see CLAUDE.md's Current
+    State section) rather than a placeholder "transcribing" status.
+
+    Raises `DispatchValidationError` for permanently-invalid input (empty or
+    oversized audio), same contract as `_resolve_worker_object`.
+    """
+    if original_size_bytes <= 0:
+        raise DispatchValidationError(f"empty file: file_id={file_id!r}")
+    if original_size_bytes > MAX_AUDIO_BYTES:
+        raise DispatchValidationError(f"audio file exceeds MAX_AUDIO_BYTES: file_id={file_id!r}")
+
+    if TRANSCRIPTION_PROVIDER == "fake":
+        jsonl_bytes = fake_transcript_jsonl(file_id)
+        extracted_key = f"extracted/{file_id}{EXTRACTED_TEXT_SUFFIX}"
+        s3.put_object(
+            Bucket=s3_bucket,
+            Key=extracted_key,
+            Body=jsonl_bytes,
+            ContentType="application/x-ndjson",
+        )
+        fan_out_partitions(
+            file_id=file_id,
+            s3_bucket=s3_bucket,
+            original_s3_key=file_id,
+            original_file_size_bytes=original_size_bytes,
+            worker_s3_key=extracted_key,
+            worker_size_bytes=len(jsonl_bytes),
+            num_partitions=NUM_PARTITIONS,
+            worker_queue_url=WORKER_QUEUE_URL,
+            file_status_table=FILE_STATUS_TABLE,
+            partition_format=PartitionFormat.TRANSCRIPT.value,
+        )
+        return
+
+    start_transcription_job(s3_bucket, file_id)
+
+
+def _is_video_upload(file_id: str) -> bool:
+    return file_id.lower().endswith(tuple(VIDEO_EXTENSIONS))
+
+
+def _dispatch_video_upload(s3_bucket: str, file_id: str, original_size_bytes: int) -> None:
+    """Video's real path is structurally like audio's two-phase split, but
+    the async work (a pluggable, possibly-slow vision-LLM call) runs on a
+    Fargate task orchestrated by Step Functions instead of AWS Transcribe --
+    see infra/cloud/modules/video_pipeline and src/video_task. There's no
+    managed AWS service for "detect objects in this video," so unlike audio
+    this pipeline owns the compute for the real path, not just the
+    completion callback.
+
+    `VIDEO_PROVIDER=fake` (local dev, no Step Functions/ECS emulator exists)
+    fabricates a placeholder object-detection JSONL inline and fans out
+    immediately, in this same invocation -- same shape as the fake-mode audio
+    tail. `VIDEO_PROVIDER=<anything else>` (real) starts a Step Functions
+    execution and returns; the `video_completion` Lambda (invoked directly by
+    that state machine once its Fargate task finishes) stages the real result
+    and calls `fan_out_partitions` from there instead. Either way, no
+    `file_status` record exists for this file until whichever path's
+    `fan_out_partitions` call runs -- same accepted invisible-while-processing
+    limitation already documented for real-mode audio.
+
+    Raises `DispatchValidationError` for permanently-invalid input (empty or
+    oversized video), same contract as `_dispatch_audio_upload`.
+    """
+    if original_size_bytes <= 0:
+        raise DispatchValidationError(f"empty file: file_id={file_id!r}")
+    if original_size_bytes > MAX_VIDEO_BYTES:
+        raise DispatchValidationError(f"video file exceeds MAX_VIDEO_BYTES: file_id={file_id!r}")
+
+    if VIDEO_PROVIDER == "fake":
+        jsonl_bytes = fake_video_objects_jsonl(file_id)
+        extracted_key = f"extracted/{file_id}{EXTRACTED_TEXT_SUFFIX}"
+        s3.put_object(
+            Bucket=s3_bucket,
+            Key=extracted_key,
+            Body=jsonl_bytes,
+            ContentType="application/x-ndjson",
+        )
+        fan_out_partitions(
+            file_id=file_id,
+            s3_bucket=s3_bucket,
+            original_s3_key=file_id,
+            original_file_size_bytes=original_size_bytes,
+            worker_s3_key=extracted_key,
+            worker_size_bytes=len(jsonl_bytes),
+            num_partitions=NUM_PARTITIONS,
+            worker_queue_url=WORKER_QUEUE_URL,
+            file_status_table=FILE_STATUS_TABLE,
+            partition_format=PartitionFormat.VIDEO.value,
+        )
+        return
+
+    start_video_analysis_execution(VIDEO_STATE_MACHINE_ARN, s3_bucket, file_id)
 
 
 def _resolve_worker_object(

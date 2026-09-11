@@ -1,0 +1,4 @@
+# boto3 is provided by the Lambda runtime; no extra third-party dependencies
+# needed -- unlike dispatcher's pypdf layer, AWS Transcribe is a plain boto3
+# client, same tier as rds-data. common/ ships as a separate Lambda Layer, not
+# bundled into this function's zip.

@@ -1,0 +1,3 @@
+# Unlike every Lambda's requirements.txt in this repo, ECS Fargate has no
+# runtime-provided boto3 -- it must be installed explicitly into the image.
+boto3>=1.34

@@ -31,10 +31,14 @@ export default function FileUpload({
   return (
     <div>
       <label className="flex cursor-pointer flex-col items-center gap-2 rounded-md border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500 hover:border-zinc-400 dark:border-zinc-700">
-        <span>{uploading ? "Uploading…" : "Click to choose a .txt or .pdf file to ingest"}</span>
+        <span>
+          {uploading
+            ? "Uploading…"
+            : "Click to choose a .txt, .pdf, audio (.mp3/.wav/.m4a/.flac), or video (.mp4/.mov/.webm) file to ingest"}
+        </span>
         <input
           type="file"
-          accept=".txt,text/plain,.pdf,application/pdf"
+          accept=".txt,text/plain,.pdf,application/pdf,.mp3,audio/mpeg,.wav,audio/wav,.m4a,audio/mp4,.flac,audio/flac,.mp4,video/mp4,.mov,video/quicktime,.webm,video/webm"
           className="hidden"
           disabled={uploading}
           onChange={(e) => {

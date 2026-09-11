@@ -10,6 +10,21 @@ class FileStatus(StrEnum):
     FAILED = "failed"
 
 
+class PartitionFormat(StrEnum):
+    """What shape of bytes a WorkerMessage's partition holds -- not to be
+    confused with an S3/HTTP "content type" (MIME type), hence the distinct
+    name. TEXT is flat prose (.txt, or PDF-extracted text); TRANSCRIPT and
+    VIDEO are both newline-delimited JSON segments (see
+    common/transcript_chunking.py) with an identical wire shape but different
+    provenance -- TRANSCRIPT from speech-to-text, VIDEO from visual
+    object/product detection -- kept as distinct values so that provenance
+    survives into each chunk's metadata (see worker/handler.py)."""
+
+    TEXT = "text"
+    TRANSCRIPT = "transcript"
+    VIDEO = "video"
+
+
 @dataclass
 class WorkerMessage:
     """One dispatch-queue -> worker-queue message: a single byte-range partition to embed."""
@@ -23,6 +38,7 @@ class WorkerMessage:
     start_byte: int
     end_byte: int
     redrive_count: int = 0
+    partition_format: str = PartitionFormat.TEXT.value
 
 
 @dataclass

@@ -46,6 +46,44 @@ variable "db_writer_timeout_seconds" {
   default     = 60
 }
 
+variable "transcribe_completion_timeout_seconds" {
+  description = "transcribe_completion Lambda timeout."
+  type        = number
+  default     = 60
+}
+
+variable "video_completion_timeout_seconds" {
+  description = "video_completion Lambda timeout."
+  type        = number
+  default     = 60
+}
+
+# ── Video pipeline ───────────────────────────────────────────────────────────
+
+variable "video_task_cpu" {
+  description = "Fargate video-analysis task CPU units (1024 = 1 vCPU)."
+  type        = string
+  default     = "1024"
+}
+
+variable "video_task_memory" {
+  description = "Fargate video-analysis task memory, in MB."
+  type        = string
+  default     = "2048"
+}
+
+variable "video_analysis_timeout_seconds" {
+  description = "Step Functions video-analysis Task state timeout -- a safety net, not a real operational ceiling (a real vision-LLM call's actual duration is unknown until one exists)."
+  type        = number
+  default     = 3600
+}
+
+variable "video_provider" {
+  description = "VIDEO_PROVIDER for dispatcher/the video-analysis Fargate task. Deliberately NOT 'fake' by default -- unlike the other dual-backend toggles, no real provider is implemented yet, so a real terraform apply should surface a deliberate NotImplementedError rather than silently behave like local dev."
+  type        = string
+  default     = "unimplemented"
+}
+
 # ── Aurora ───────────────────────────────────────────────────────────────────
 
 variable "aurora_min_capacity" {

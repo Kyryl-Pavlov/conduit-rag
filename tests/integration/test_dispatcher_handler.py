@@ -1,4 +1,5 @@
 import json
+from unittest.mock import patch
 
 import boto3
 import pytest
@@ -186,6 +187,157 @@ def test_unsupported_extension_is_marked_failed(aws_env):
 
 def test_empty_file_is_marked_failed(aws_env):
     key = "uploads/empty.txt"
+    event = {"Records": [_s3_event_sqs_record(UPLOADS_BUCKET, key, 0)]}
+
+    handler(event, None)  # must not raise -- SQS would retry forever otherwise
+
+    table = aws_env["dynamodb"].Table(FILE_STATUS_TABLE)
+    item = table.get_item(Key={"file_id": key})["Item"]
+    assert item["status"] == "failed"
+    assert "empty file" in item["error"]
+    assert _drain_queue(aws_env["sqs"], aws_env["worker_queue_url"]) == []
+
+
+def test_audio_upload_fake_mode_fans_out_as_transcript(aws_env, monkeypatch):
+    monkeypatch.setattr(handler_module, "TRANSCRIPTION_PROVIDER", "fake")
+    key = "uploads/example.mp3"
+    event = {"Records": [_s3_event_sqs_record(UPLOADS_BUCKET, key, 5_000)]}
+
+    handler(event, None)
+
+    extracted_key = f"extracted/{key}.extracted"
+    extracted_body = (
+        aws_env["s3"].get_object(Bucket=UPLOADS_BUCKET, Key=extracted_key)["Body"].read()
+    )
+    assert extracted_body  # fake_transcript_jsonl fabricated something
+
+    # file_status stays keyed on the ORIGINAL audio upload -- s3_key/
+    # file_size_bytes must reflect it, not the staged JSONL transcript, same
+    # split the PDF path already makes.
+    table = aws_env["dynamodb"].Table(FILE_STATUS_TABLE)
+    item = table.get_item(Key={"file_id": key})["Item"]
+    assert item["s3_key"] == key
+    assert item["file_size_bytes"] == 5_000
+
+    messages = _drain_queue(aws_env["sqs"], aws_env["worker_queue_url"])
+    assert len(messages) >= 1
+    assert all(m["file_id"] == key for m in messages)
+    assert all(m["s3_key"] == extracted_key for m in messages)
+    assert all(m["partition_format"] == "transcript" for m in messages)
+
+
+def test_audio_upload_real_mode_starts_job_without_file_status(aws_env, monkeypatch):
+    monkeypatch.setattr(handler_module, "TRANSCRIPTION_PROVIDER", "transcribe")
+    key = "uploads/example.mp3"
+    event = {"Records": [_s3_event_sqs_record(UPLOADS_BUCKET, key, 5_000)]}
+
+    with patch("dispatcher.handler.start_transcription_job") as mock_start:
+        handler(event, None)
+
+    mock_start.assert_called_once_with(UPLOADS_BUCKET, key)
+
+    # No file_status record yet -- transcription is async, and
+    # transcribe_completion (not dispatcher) creates it once the job finishes.
+    table = aws_env["dynamodb"].Table(FILE_STATUS_TABLE)
+    assert "Item" not in table.get_item(Key={"file_id": key})
+    assert _drain_queue(aws_env["sqs"], aws_env["worker_queue_url"]) == []
+
+
+def test_oversized_audio_is_marked_failed(aws_env, monkeypatch):
+    monkeypatch.setattr(handler_module, "MAX_AUDIO_BYTES", 1_000)
+    key = "uploads/huge.mp3"
+    event = {"Records": [_s3_event_sqs_record(UPLOADS_BUCKET, key, 2_000)]}
+
+    handler(event, None)  # must not raise -- SQS would retry forever otherwise
+
+    table = aws_env["dynamodb"].Table(FILE_STATUS_TABLE)
+    item = table.get_item(Key={"file_id": key})["Item"]
+    assert item["status"] == "failed"
+    assert "MAX_AUDIO_BYTES" in item["error"]
+    assert _drain_queue(aws_env["sqs"], aws_env["worker_queue_url"]) == []
+
+
+def test_empty_audio_is_marked_failed(aws_env):
+    key = "uploads/empty.mp3"
+    event = {"Records": [_s3_event_sqs_record(UPLOADS_BUCKET, key, 0)]}
+
+    handler(event, None)  # must not raise -- SQS would retry forever otherwise
+
+    table = aws_env["dynamodb"].Table(FILE_STATUS_TABLE)
+    item = table.get_item(Key={"file_id": key})["Item"]
+    assert item["status"] == "failed"
+    assert "empty file" in item["error"]
+    assert _drain_queue(aws_env["sqs"], aws_env["worker_queue_url"]) == []
+
+
+def test_video_upload_fake_mode_fans_out_as_video(aws_env, monkeypatch):
+    monkeypatch.setattr(handler_module, "VIDEO_PROVIDER", "fake")
+    key = "uploads/example.mp4"
+    event = {"Records": [_s3_event_sqs_record(UPLOADS_BUCKET, key, 5_000)]}
+
+    handler(event, None)
+
+    extracted_key = f"extracted/{key}.extracted"
+    extracted_body = (
+        aws_env["s3"].get_object(Bucket=UPLOADS_BUCKET, Key=extracted_key)["Body"].read()
+    )
+    assert extracted_body  # fake_video_objects_jsonl fabricated something
+
+    # file_status stays keyed on the ORIGINAL video upload -- s3_key/
+    # file_size_bytes must reflect it, not the staged JSONL detections, same
+    # split the PDF/audio paths already make.
+    table = aws_env["dynamodb"].Table(FILE_STATUS_TABLE)
+    item = table.get_item(Key={"file_id": key})["Item"]
+    assert item["s3_key"] == key
+    assert item["file_size_bytes"] == 5_000
+
+    messages = _drain_queue(aws_env["sqs"], aws_env["worker_queue_url"])
+    assert len(messages) >= 1
+    assert all(m["file_id"] == key for m in messages)
+    assert all(m["s3_key"] == extracted_key for m in messages)
+    assert all(m["partition_format"] == "video" for m in messages)
+
+
+def test_video_upload_real_mode_starts_execution_without_file_status(aws_env, monkeypatch):
+    monkeypatch.setattr(handler_module, "VIDEO_PROVIDER", "some-real-provider")
+    monkeypatch.setattr(
+        handler_module,
+        "VIDEO_STATE_MACHINE_ARN",
+        "arn:aws:states:us-east-1:123456789012:stateMachine:x",
+    )
+    key = "uploads/example.mp4"
+    event = {"Records": [_s3_event_sqs_record(UPLOADS_BUCKET, key, 5_000)]}
+
+    with patch("dispatcher.handler.start_video_analysis_execution") as mock_start:
+        handler(event, None)
+
+    mock_start.assert_called_once_with(
+        "arn:aws:states:us-east-1:123456789012:stateMachine:x", UPLOADS_BUCKET, key
+    )
+
+    # No file_status record yet -- video analysis is async, and
+    # video_completion (not dispatcher) creates it once the execution finishes.
+    table = aws_env["dynamodb"].Table(FILE_STATUS_TABLE)
+    assert "Item" not in table.get_item(Key={"file_id": key})
+    assert _drain_queue(aws_env["sqs"], aws_env["worker_queue_url"]) == []
+
+
+def test_oversized_video_is_marked_failed(aws_env, monkeypatch):
+    monkeypatch.setattr(handler_module, "MAX_VIDEO_BYTES", 1_000)
+    key = "uploads/huge.mp4"
+    event = {"Records": [_s3_event_sqs_record(UPLOADS_BUCKET, key, 2_000)]}
+
+    handler(event, None)  # must not raise -- SQS would retry forever otherwise
+
+    table = aws_env["dynamodb"].Table(FILE_STATUS_TABLE)
+    item = table.get_item(Key={"file_id": key})["Item"]
+    assert item["status"] == "failed"
+    assert "MAX_VIDEO_BYTES" in item["error"]
+    assert _drain_queue(aws_env["sqs"], aws_env["worker_queue_url"]) == []
+
+
+def test_empty_video_is_marked_failed(aws_env):
+    key = "uploads/empty.mp4"
     event = {"Records": [_s3_event_sqs_record(UPLOADS_BUCKET, key, 0)]}
 
     handler(event, None)  # must not raise -- SQS would retry forever otherwise
