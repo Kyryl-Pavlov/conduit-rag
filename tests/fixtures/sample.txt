@@ -1,0 +1,7 @@
+Conduit RAG is an LLM-agnostic retrieval system. It ingests text and PDF files, partitions them into byte-range sections, chunks the extracted text into fixed token-limit windows, embeds each chunk with Amazon Bedrock's Titan Text Embeddings model, and stores the resulting vectors in an Aurora Serverless Postgres cluster running the pgvector extension.
+
+Retrieval and storage are fully decoupled from generation. Any large language model -- Claude, Gemini, ChatGPT, or otherwise -- can query the system's REST API and perform its own generation step using the returned chunks as grounding context. The RAG system itself never calls an LLM to generate an answer.
+
+Ingestion is driven by a chain of AWS Lambda functions coordinated through Amazon SQS. A dispatcher Lambda receives S3 upload notifications, partitions the file into roughly ten byte-range sections, and fans out one message per partition to a worker queue. Worker Lambdas read their assigned byte range, chunk the text, call the embedding model, and forward the resulting vectors to a write queue for eventual persistence.
+
+This sample file exists purely to exercise that pipeline end to end in the local docker-compose environment: upload through the simulate_upload helper script, watch the dispatcher partition it, watch the workers embed each chunk with the fake local embedder, and confirm the resulting messages land on the write queue with the expected shape.

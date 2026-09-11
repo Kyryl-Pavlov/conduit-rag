@@ -1,0 +1,5 @@
+# boto3 is provided by the Lambda runtime; no extra third-party dependencies
+# needed in the real deployment target. DB_MODE=data_api (the production
+# default) only ever calls boto3's rds-data client -- psycopg is a
+# local-docker-only dependency (see root requirements.txt), never bundled
+# into this function's zip.

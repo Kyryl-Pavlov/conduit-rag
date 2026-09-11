@@ -1,0 +1,5 @@
+# Copy to dev.tfvars (gitignored) and adjust as needed:
+#   terraform plan -var-file=dev.tfvars
+
+environment = "dev"
+aws_region  = "us-east-1"

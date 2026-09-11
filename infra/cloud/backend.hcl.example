@@ -1,0 +1,11 @@
+# Copy to infra/cloud/backend.hcl (gitignored) and fill in the values printed by
+# `terraform apply` in infra/cloud/bootstrap/.
+#
+#   cp backend.hcl.example backend.hcl
+#   terraform init -backend-config=backend.hcl
+
+bucket         = "kporg-conduit-rag-tfstate"
+key            = "conduit-rag/terraform.tfstate"
+region         = "us-east-1"
+dynamodb_table = "kporg-conduit-rag-tfstate-lock"
+encrypt        = true

@@ -1,0 +1,3 @@
+# boto3 is provided by the Lambda runtime; no extra third-party dependencies
+# needed for this phase. common/ ships as a separate Lambda Layer, not bundled
+# into this function's zip.

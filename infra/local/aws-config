@@ -1,0 +1,6 @@
+# Forces path-style S3 addressing (bucket in the URL path, not a subdomain),
+# since local docker-compose has no wildcard DNS for virtual-hosted-style
+# bucket subdomains. Mounted read-only, pointed at via AWS_CONFIG_FILE.
+[default]
+s3 =
+    addressing_style = path
