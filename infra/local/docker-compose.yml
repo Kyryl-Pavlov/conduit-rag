@@ -1,0 +1,213 @@
+x-aws-local-credentials: &aws-local-credentials
+  # Must match minio's MINIO_ROOT_USER/MINIO_ROOT_PASSWORD below -- ElasticMQ
+  # doesn't validate credentials, but MinIO (S3) and dynamodb-local both do.
+  # No hyphens: dynamodb-local enforces an AWS-like alphanumeric-only access
+  # key ID format and rejects anything else with UnrecognizedClientException.
+  AWS_ACCESS_KEY_ID: localaccesskey
+  AWS_SECRET_ACCESS_KEY: localsecretkey
+  AWS_DEFAULT_REGION: us-east-1
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: conduit_rag
+      POSTGRES_USER: conduit_rag
+      POSTGRES_PASSWORD: conduit_rag
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U conduit_rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "8000:8000"
+
+  bootstrap-dynamodb:
+    build:
+      context: ../..
+      dockerfile: infra/local/python.Dockerfile
+    command: ["scripts/bootstrap_dynamodb.py"]
+    environment:
+      <<: *aws-local-credentials
+      AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb-local:8000
+    depends_on:
+      - dynamodb-local
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: localaccesskey
+      MINIO_ROOT_PASSWORD: localsecretkey
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  # Idiomatic MinIO bucket-creation pattern. Retries `mc ready` itself (rather
+  # than relying on a container healthcheck whose tooling we can't be sure of
+  # in the upstream minio/minio image), so it self-heals regardless of exact
+  # startup ordering.
+  mc-init:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 localaccesskey localsecretkey; do sleep 2; done &&
+      until mc ready local; do sleep 2; done &&
+      mc mb -p local/conduit-rag-dev-uploads
+      "
+
+  elasticmq:
+    image: softwaremill/elasticmq-native:latest
+    ports:
+      - "9324:9324"
+    volumes:
+      - ./elasticmq.conf:/opt/elasticmq.conf:ro
+
+  dispatcher:
+    build:
+      context: ../..
+      dockerfile: infra/local/python.Dockerfile
+    command: ["scripts/run_dispatcher.py"]
+    environment:
+      <<: *aws-local-credentials
+      # Needed for the .pdf path only -- dispatcher downloads the PDF and
+      # re-uploads its extracted text (see src/dispatcher/handler.py). The
+      # .txt path still never calls S3.
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_ENDPOINT_URL_SQS: http://elasticmq:9324
+      AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb-local:8000
+      DISPATCH_QUEUE_URL: http://elasticmq:9324/queue/dispatch-queue
+      WORKER_QUEUE_URL: http://elasticmq:9324/queue/worker-queue
+      FILE_STATUS_TABLE: file-status
+      NUM_PARTITIONS: "10"
+      MAX_PDF_BYTES: "52428800"
+    depends_on:
+      elasticmq:
+        condition: service_started
+      bootstrap-dynamodb:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/local/python.Dockerfile
+    command: ["scripts/run_worker.py"]
+    env_file: .env
+    environment:
+      <<: *aws-local-credentials
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_ENDPOINT_URL_SQS: http://elasticmq:9324
+      WORKER_QUEUE_URL: http://elasticmq:9324/queue/worker-queue
+      WRITE_QUEUE_URL: http://elasticmq:9324/queue/write-queue
+      # Real Bedrock now (see AWS_BEDROCK_* in .env) -- must match whatever
+      # the frontend embeds queries with, or similarity search compares
+      # real vectors against noise. Set back to "fake" for offline dev.
+      EMBEDDINGS_PROVIDER: bedrock
+    depends_on:
+      - elasticmq
+      - minio
+    restart: unless-stopped
+
+  db-writer:
+    build:
+      context: ../..
+      dockerfile: infra/local/python.Dockerfile
+    command: ["scripts/run_db_writer.py"]
+    environment:
+      <<: *aws-local-credentials
+      AWS_ENDPOINT_URL_SQS: http://elasticmq:9324
+      AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb-local:8000
+      WRITE_QUEUE_URL: http://elasticmq:9324/queue/write-queue
+      FILE_STATUS_TABLE: file-status
+      CHUNK_COMPLETION_TABLE: chunk-completion
+      # Data API has no local emulator (see common/vectordb.py) -- talk to
+      # the local Postgres container directly over the wire protocol instead.
+      DB_MODE: psycopg
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: conduit_rag
+      POSTGRES_USER: conduit_rag
+      POSTGRES_PASSWORD: conduit_rag
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticmq:
+        condition: service_started
+      bootstrap-dynamodb:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../../frontend
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      <<: *aws-local-credentials
+      # Real Bedrock (see AWS_BEDROCK_* in .env) -- must match worker's
+      # EMBEDDINGS_PROVIDER above, or query embeddings won't be comparable
+      # to stored chunk embeddings.
+      EMBEDDINGS_PROVIDER: bedrock
+      # Only the upload route ever touches S3, and only to mint a presigned
+      # URL the *browser* PUTs against -- so it needs a browser-reachable
+      # host, unlike DYNAMODB/SQS below which are only ever called
+      # server-side and use the ordinary docker-network hostnames.
+      AWS_ENDPOINT_URL_S3_PUBLIC: http://localhost:9000
+      # Server-side S3 calls (e.g. deleting an object) run inside this
+      # container, so unlike the browser-facing _PUBLIC var above, this one
+      # uses the docker-network hostname -- matches the Python side's
+      # AWS_ENDPOINT_URL_S3.
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb-local:8000
+      AWS_ENDPOINT_URL_SQS: http://elasticmq:9324
+      UPLOAD_BUCKET: conduit-rag-dev-uploads
+      FILE_STATUS_TABLE: file-status
+      CHUNK_COMPLETION_TABLE: chunk-completion
+      DISPATCH_QUEUE_URL: http://elasticmq:9324/queue/dispatch-queue
+      # Data API has no local emulator (see lib/vectordb.ts) -- talk to the
+      # local Postgres container directly over the wire protocol instead,
+      # same as db-writer above.
+      DB_MODE: psycopg
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: conduit_rag
+      POSTGRES_USER: conduit_rag
+      POSTGRES_PASSWORD: conduit_rag
+      # Bind-mounted source over a Windows host can miss inotify events;
+      # polling makes hot reload reliable regardless of the host OS.
+      WATCHPACK_POLLING: "true"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../../frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      minio:
+        condition: service_started
+      elasticmq:
+        condition: service_started
+      dynamodb-local:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  minio-data:

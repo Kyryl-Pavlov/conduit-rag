@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.env
+
+# Terraform
+infra/**/.terraform/
+infra/**/.terraform.lock.hcl
+infra/**/*.tfstate
+infra/**/*.tfstate.*
+infra/**/crash.log
+infra/**/backend.hcl
+infra/**/*.tfvars
+!infra/**/*.tfvars.example
+
+# Build artifacts
+build/
+dist/
+*.zip
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code (personal settings / agent worktrees, not shared project config)
+.claude/settings.local.json
+.claude/worktrees/
