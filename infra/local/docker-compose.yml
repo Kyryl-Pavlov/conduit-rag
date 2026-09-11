@@ -94,6 +94,25 @@ services:
       FILE_STATUS_TABLE: file-status
       NUM_PARTITIONS: "10"
       MAX_PDF_BYTES: "52428800"
+      MAX_AUDIO_BYTES: "2147483648"
+      # No Transcribe/EventBridge emulator exists locally (same tier as
+      # Bedrock/the RDS Data API) -- "fake" fabricates a deterministic
+      # placeholder transcript synchronously inside dispatcher instead of
+      # starting a real async job, so audio uploads still flow end-to-end
+      # through docker-compose. Unlike EMBEDDINGS_PROVIDER=bedrock above,
+      # there is no real-Transcribe local mode: switching this to
+      # "transcribe" would need real AWS credentials and an EventBridge rule
+      # that doesn't exist in this stack.
+      TRANSCRIPTION_PROVIDER: fake
+      MAX_VIDEO_BYTES: "10737418240"
+      # Same story as TRANSCRIPTION_PROVIDER above, one tier further: no Step
+      # Functions/ECS/Fargate emulator exists locally either, and no real
+      # video-LLM provider is implemented yet regardless -- "fake" fabricates
+      # a deterministic placeholder object-detection JSONL synchronously
+      # inside dispatcher, so video uploads flow end-to-end through
+      # docker-compose the same way fake-mode audio does. There is no way to
+      # run the real path locally.
+      VIDEO_PROVIDER: fake
     depends_on:
       elasticmq:
         condition: service_started

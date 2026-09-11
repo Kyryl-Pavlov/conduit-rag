@@ -79,6 +79,118 @@ def test_worker_embeds_and_forwards_chunks(aws_env):
     assert words[-1] in all_words_seen
 
 
+def test_worker_transcript_mode_embeds_with_timestamps(aws_env):
+    segments = [
+        {
+            "start": float(i),
+            "end": float(i) + 1.0,
+            "text": f"segment number {i:04d} with some words",
+        }
+        for i in range(20)
+    ]
+    text = "\n".join(json.dumps(s) for s in segments) + "\n"
+    key = "extracted/example.mp3.extracted"
+    aws_env["s3"].put_object(Bucket=UPLOADS_BUCKET, Key=key, Body=text.encode("utf-8"))
+
+    message = WorkerMessage(
+        file_id="uploads/example.mp3",
+        s3_bucket=UPLOADS_BUCKET,
+        s3_key=key,
+        file_size_bytes=len(text.encode("utf-8")),
+        worker_index=0,
+        total_workers=1,
+        start_byte=0,
+        end_byte=len(text.encode("utf-8")) - 1,
+        partition_format="transcript",
+    )
+    event = {"Records": [{"body": json.dumps(asdict(message))}]}
+
+    with patch("worker.handler.embed_batch", side_effect=_fake_embed_batch):
+        handler(event, None)
+
+    written = _drain_queue(aws_env["sqs"], aws_env["write_queue_url"])
+    assert len(written) >= 1
+    for msg in written:
+        assert msg["metadata"]["end_time"] > msg["metadata"]["start_time"]
+
+    # chunks are emitted in order, and window start indices only advance --
+    # so start_time must be non-decreasing across consecutive chunks.
+    starts = [msg["metadata"]["start_time"] for msg in written]
+    assert starts == sorted(starts)
+
+
+def test_worker_video_mode_embeds_with_timestamps(aws_env):
+    segments = [
+        {
+            "start": float(i),
+            "end": float(i) + 1.0,
+            "text": f"Detected object: red sneaker (#{i}).",
+        }
+        for i in range(20)
+    ]
+    text = "\n".join(json.dumps(s) for s in segments) + "\n"
+    key = "extracted/example.mp4.extracted"
+    aws_env["s3"].put_object(Bucket=UPLOADS_BUCKET, Key=key, Body=text.encode("utf-8"))
+
+    message = WorkerMessage(
+        file_id="uploads/example.mp4",
+        s3_bucket=UPLOADS_BUCKET,
+        s3_key=key,
+        file_size_bytes=len(text.encode("utf-8")),
+        worker_index=0,
+        total_workers=1,
+        start_byte=0,
+        end_byte=len(text.encode("utf-8")) - 1,
+        partition_format="video",
+    )
+    event = {"Records": [{"body": json.dumps(asdict(message))}]}
+
+    with patch("worker.handler.embed_batch", side_effect=_fake_embed_batch):
+        handler(event, None)
+
+    written = _drain_queue(aws_env["sqs"], aws_env["write_queue_url"])
+    assert len(written) >= 1
+    for msg in written:
+        assert msg["metadata"]["end_time"] > msg["metadata"]["start_time"]
+        assert msg["metadata"]["partition_format"] == "video"
+
+    # chunks are emitted in order, and window start indices only advance --
+    # so start_time must be non-decreasing across consecutive chunks.
+    starts = [msg["metadata"]["start_time"] for msg in written]
+    assert starts == sorted(starts)
+
+
+def test_worker_defaults_to_text_mode_when_partition_format_omitted(aws_env):
+    # Simulates an old in-flight message sent before WorkerMessage grew the
+    # partition_format field -- the handler must read it with .get(), not a
+    # subscript, and fall back to plain-text chunking.
+    text = "just a short piece of plain text for the default path"
+    key = "uploads/example.txt"
+    aws_env["s3"].put_object(Bucket=UPLOADS_BUCKET, Key=key, Body=text.encode("utf-8"))
+
+    message = WorkerMessage(
+        file_id=key,
+        s3_bucket=UPLOADS_BUCKET,
+        s3_key=key,
+        file_size_bytes=len(text.encode("utf-8")),
+        worker_index=0,
+        total_workers=1,
+        start_byte=0,
+        end_byte=len(text.encode("utf-8")) - 1,
+    )
+    body = asdict(message)
+    del body["partition_format"]
+    event = {"Records": [{"body": json.dumps(body)}]}
+
+    with patch("worker.handler.embed_batch", side_effect=_fake_embed_batch):
+        handler(event, None)
+
+    written = _drain_queue(aws_env["sqs"], aws_env["write_queue_url"])
+    assert len(written) == 1
+    assert written[0]["text"] == text
+    assert "start_time" not in written[0]["metadata"]
+
+
 def _drain_queue(sqs, queue_url: str) -> list[dict]:
     messages = []
     while True:
